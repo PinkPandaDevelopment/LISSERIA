@@ -15,6 +15,8 @@ from typing import Dict
 import pytz
 import os
 import glob
+from io import BytesIO
+
 
 
 warnings.filterwarnings("ignore")
@@ -314,36 +316,32 @@ def butterworth_filter(signal, cutoff=0.1, fs=1, order=5) -> np.ndarray:
     filtered_signal = sig.filtfilt(b, a, signal)
     return filtered_signal
 
-def get_denoised_signal(df,cutoff,gases) -> pd.DataFrame:
-    """
-    Obtain denoised signals for specified gases using a Butterworth filter.
+def get_denoised_signal(df, cutoff, gases) -> pd.DataFrame:
+    df_denoised = pd.DataFrame()
 
-    Parameters:
-    - df (pd.DataFrame): Input DataFrame containing gas measurements.
-    - cutoff (float): Cutoff frequency of the Butterworth filter.
-    - gases (list): List of gases to denoise.
-
-    Returns:
-    - pd.DataFrame: DataFrame containing denoised signals for each specified gas.
-
-    
-    """
-    df_denoised=pd.DataFrame()
     for gas in gases:
         gas_measurements = df[gas].values
-        #finding the best order for the filter
-        #Making it stop when the next order is worse than the previous one in 
-        # terms of the MSE between the original and the filtered signal
-        mse_prev=10000
-        for order in range(1,10):
-            gas_measurements_denoised=butterworth_filter(gas_measurements,cutoff,1,order)
-            mse=np.mean((gas_measurements-gas_measurements_denoised)**2)
-            if mse>mse_prev:
-                break   
-            mse_prev=mse
-        #Adding the filtered signal to the df
-        df_denoised[gas]=gas_measurements_denoised      
+
+        if len(gas_measurements) < 7:
+            # Si no hay suficientes datos, devolver la señal sin filtrar
+            df_denoised[gas] = gas_measurements
+            continue
+
+        mse_prev = 10000
+        for order in range(1, 10):
+            try:
+                gas_measurements_denoised = butterworth_filter(gas_measurements, cutoff, 1, order)
+                mse = np.mean((gas_measurements - gas_measurements_denoised) ** 2)
+                if mse > mse_prev:
+                    break
+                mse_prev = mse
+            except ValueError:
+                break  # Si el filtro falla, salta al siguiente gas
+
+        df_denoised[gas] = gas_measurements_denoised
+
     return df_denoised
+
 
 
 ##################Classification#####################
@@ -426,7 +424,8 @@ def classify_route(df,speed='speed',altitude='A_1') -> int:
         resample=df[[speed,altitude,'time']]
         resample['time']=pd.date_range(start='01/01/23', periods=len(resample), freq='T')
         resample.set_index('time', inplace=True)
-        resample=resample_dataframe(resample,65)
+        resample, _ = resample_dataframe(resample, time_column="time", target_len=65)
+
         #Cut the dataframe to have the minimum len according to the previous analysis
         min_len=62
         #print(f'The length of the dataframe is {len(resample)}')
@@ -504,69 +503,70 @@ def normalize_columns(df: pd.DataFrame, col1: str, col2: str) -> pd.DataFrame:
 
     return normalized_df
 
-def predict_signal_h2(df,file,variables)-> pd.DataFrame:
+def predict_signal_h2(df, file, variables) -> pd.DataFrame:
     """
     Predict the H2 signal using a pre-trained model.
 
     Parameters:
     - df: DataFrame
-    - file: str, the name of the file containing the model
-    - variables: list, the list of variables to use for the prediction
+    - file: str, the name of the file containing the model (e.g., 'modelos/h2_randomforest.pkl')
+    - variables: list, the list of variables to use for the prediction (e.g., ['CO', 'NO2', 'Metano_CH4'])
 
     Returns:
-    - DataFrame with the predicted values
+    - df_pred: DataFrame with the predicted values, including time, predicted H₂ signal, and confidence intervals
 
-    The function takes a DataFrame with gas measurements, a file containing a pre-trained model,
-    and a list of variables to use for the prediction. It predicts the H2 signal and returns a DataFrame
-    with the predicted values.
-
+    This function takes a DataFrame with gas measurements, uses a pre-trained model to predict the H₂ signal,
+    and returns a DataFrame with the predictions and confidence intervals. If the real H₂ signal is not present,
+    it will skip normalization and use default placeholders.
     """
-    #Load the model
-    model=load_pred_models(file)
-    #Get the predictionsdf
-    df_pred=pd.DataFrame()
+
+    import matplotlib.pyplot as plt
+    from datetime import datetime
+
+    # Load the pre-trained model
+    model = load_pred_models(file)
+
+    # Ensure the 'time' column exists
+    if 'time' not in df.columns:
+        raise ValueError("La columna 'time' es requerida en los datos para la predicción.")
+
+    # Remove rows where 'time' is NaN
     df = df.dropna(subset=['time'])
-    df_pred['time']=df['time']
-    df_pred['H2']=df['H₂']
 
-    df_pred = df_pred.dropna(subset=['time'])
-    
+    # Create a new DataFrame to store results
+    df_pred = pd.DataFrame()
 
-    # Check for any parsing errors
-    if df_pred['time'].isna().any():
-        print("Warning: Some time values couldn't be parsed.")
-    df_pred['h2_pred']=model.predict(df[variables])
-    #Normalize the variables
-    df_pred=normalize_columns(df_pred,'H2','h2_pred')
-    #Get the confidence interval
-       
-    df_pred['h2_pred_lower']=df_pred['h2_pred']-1.96*df_pred['h2_pred'].std()
-    df_pred['h2_pred_upper']=df_pred['h2_pred']+1.96*df_pred['h2_pred'].std()
-    
- 
-    #Getting confidence interval of the predictions
+    # Convert 'time' column to datetime format
+    df_pred['time'] = pd.to_datetime(df['time'])
 
-    #plot the predictions and the original signal with the confidence interval
-    # Create the plot
-    fig, ax = plt.subplots(figsize=(16, 8))
-    
-    ax.plot(df_pred['time'], df_pred['H2'], label='Señal del sensor')
-    ax.plot(df_pred['time'], df_pred['h2_pred'], label='Señal estimada')
-    ax.fill_between(df_pred['time'], df_pred['h2_pred_lower'], df_pred['h2_pred_upper'], alpha=0.3)
-    #Rotate the xticks
-    plt.xticks(rotation=45)
+    # Try to include the original H₂ signal if available
+    if 'H₂' in df.columns:
+        df_pred['H2'] = df['H₂']
+    else:
+        # If not available, fill with None to allow predictions anyway
+        df_pred['H2'] = None
 
-    ax.set_xlabel('Hora')
-    ax.set_ylabel('H₂ [ppm]')
-    ax.set_xticks(df_pred['time'][::250])
-    ax.legend()
+    # Make predictions using the model and selected variables
+    df_pred['h2_pred'] = model.predict(df[variables])
 
-    # Agregar un título al gráfico
-    ax.set_title('Estimación de la señal de H₂ y su intervalo de confianza')
+    # Normalize if H2 real values exist, otherwise normalize predictions only
+    if df_pred['H2'].notnull().any():
+        df_pred = normalize_columns(df_pred, 'H2', 'h2_pred')
+    else:
+        # Scale predictions between 0 and 1 as a fallback normalization
+        df_pred['H2'] = 0
+        min_pred = df_pred['h2_pred'].min()
+        max_pred = df_pred['h2_pred'].max()
+        df_pred['h2_pred'] = (df_pred['h2_pred'] - min_pred) / (max_pred - min_pred)
 
-    plt.show()
+    # Calculate confidence intervals (±1.96 * std deviation)
+    std_pred = df_pred['h2_pred'].std()
+    df_pred['h2_pred_lower'] = df_pred['h2_pred'] - 1.96 * std_pred
+    df_pred['h2_pred_upper'] = df_pred['h2_pred'] + 1.96 * std_pred
 
-    return df_pred, fig
+    # Skip plotting because it’s a backend function
+    return df_pred, None
+
 
 
 def predict_signal_ch4(df,file,variables)-> pd.DataFrame:
@@ -633,9 +633,9 @@ def predict_signal_ch4(df,file,variables)-> pd.DataFrame:
 
 ##################Geopandas#####################
 
-def df_to_geojson_anomalies(df,variables,lat_='lat',lon_='lot')-> gpd.GeoDataFrame:
+def df_to_geojson_anomalies(df,variables,lat_='lat',lon_='lon')-> gpd.GeoDataFrame:
     """ 
-    Turn a mission in df formt into a geoson, using lat and lot variables
+    Turn a mission in df formt into a geoson, using lat and lon variables
 
     Parameters:
     - df: DataFrame
@@ -657,10 +657,10 @@ def df_to_geojson_anomalies(df,variables,lat_='lat',lon_='lot')-> gpd.GeoDataFra
     #gdf1.to_file(path+mission+'.geojson', driver='GeoJSON') 
     return gdf1
 
-def df_to_geojson_neighborhood(df,gases,lat_='lat',lon_='lot',rad=0.1)-> gpd.GeoDataFrame:
+def df_to_geojson_neighborhood(df,gases,lat_='lat',lon_='lon',rad=0.1)-> gpd.GeoDataFrame:
     """
     Turn a binary variable neighborhood in df format into a geoson, using lat
-     and lot variables, setting a geometry of a circle with a radius of 3 where 
+     and lon variables, setting a geometry of a circle with a radius of 3 where
      the value is 1
 
     Parameters:
@@ -682,7 +682,7 @@ def df_to_geojson_neighborhood(df,gases,lat_='lat',lon_='lot',rad=0.1)-> gpd.Geo
     #Eliminate the rows with nan values
     df1.dropna(inplace=True)
     #Create a new column with the geometry of the point
-    df1['geometry'] = df1.apply(lambda x: Point((float(x.lot), float(x.lat))), axis=1)
+    df1['geometry'] = df1.apply(lambda x: Point((float(x.lon), float(x.lat))), axis=1)
     gdf1 = gpd.GeoDataFrame(df1, geometry='geometry')
     #Create a new column with the geometry of a circle with a radius of 3
     gdf1['geometry']=gdf1.apply(lambda x: x.geometry.buffer(rad),axis=1)
@@ -792,41 +792,66 @@ def path_plot_3d(df,gas):
     return fig
 
 # Funciones de formato
-def format_date(date_str):
-    """Convert a date from yy-m-d format to YYYY-MM-DD."""
+def format_date(datetime_str):
+    """Extrae la fecha de una cadena tipo datetime ISO y la formatea como DD/MM/YYYY."""
     try:
-        return datetime.strptime(date_str, '%y-%m-%d').strftime('%Y-%m-%d')
-    except ValueError:
-        return date_str  # Return original if it cannot be parsed
+        return datetime.fromisoformat(datetime_str).strftime('%d/%m/%Y')
+    except (ValueError, TypeError):
+        return datetime_str
 
-def format_time(time_str):
-    """Convert a time string to HH:MM:SS format."""
+def format_time(datetime_str):
+    """Extrae la hora de una cadena tipo datetime ISO y la formatea como HH:MM:SS."""
     try:
-        return datetime.strptime(time_str, '%H:%M:%S.%f').strftime('%H:%M:%S')
-    except ValueError:
-        try:
-            return datetime.strptime(time_str, '%H:%M:%S').strftime('%H:%M:%S')
-        except ValueError:
-            return time_str  # Return original if it cannot be parsed
+        return datetime.fromisoformat(datetime_str).strftime('%H:%M:%S')
+    except (ValueError, TypeError):
+        return datetime_str
+
 
 def process_geodataframe(gdf):
-    """Process GeoDataFrame to format date, time, and rename columns."""
-    # Formatear columnas de fecha y hora
-    gdf['Date'] = gdf['Date'].apply(format_date)
-    gdf['time'] = gdf['time'].apply(format_time)
+    """Procesa GeoDataFrame: extrae y formatea fecha y hora desde 'time', y genera CSV limpio."""
     
-    # Renombrar columnas
+    # Extraer fecha y hora desde 'time' si existe
+    if 'time' in gdf.columns:
+        gdf['Date'] = gdf['time'].apply(format_date)
+        gdf['Time'] = gdf['time'].apply(format_time)
+        gdf.drop(columns=['time'], inplace=True)  # Eliminar la original si ya no se necesita
+
+    # Renombrar coordenadas si existen
     gdf.rename(columns={
-        'lot': 'Longitud',
         'lat': 'Latitud',
-        'time': 'Time'
+        'lot': 'Longitud'
     }, inplace=True)
+
+    # Ordenar columnas
+    ordered_cols = ['Date', 'Time'] + [col for col in gdf.columns if col not in ['Date', 'Time']]
+    gdf = gdf[ordered_cols]
 
     # Convertir a CSV
     csv_buffer = io.StringIO()
     gdf.to_csv(csv_buffer, index=False)
-    csv_content = csv_buffer.getvalue()
-    return csv_content
+    return csv_buffer.getvalue()
 
+
+
+
+
+
+#Funciones nuevas  
+
+def load_data_csv_directo(buffer) -> pd.DataFrame:
+    """
+    Carga directamente un archivo CSV desde un buffer en memoria (BytesIO).
+    """
+    return pd.read_csv(buffer)
+
+ 
+def load_file(contents: bytes, filename: str):
+    buffer = BytesIO(contents)
+    if filename.lower().endswith(".txt"):
+        return load_data_txt(buffer)
+    elif filename.lower().endswith(".csv"):
+        return load_data_csv_directo(buffer)
+    else:
+        raise ValueError("Solo se aceptan archivos .txt o .csv")
 
 
